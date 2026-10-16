@@ -477,7 +477,7 @@ async def handle_channel_post(
 
     anime = anime_collection.find_one(
         {
-            "channel_id": message.chat_id,
+            "channel_id": message.chat.id,
             "enabled": True,
         }
     )
@@ -511,7 +511,7 @@ async def handle_channel_post(
 
     # Prevent duplicate announcements.
     post_key = {
-        "channel_id": message.chat_id,
+        "channel_id": message.chat.id,
         "message_id": message.message_id,
     }
 
@@ -539,7 +539,7 @@ async def handle_channel_post(
         source_caption = (message.caption or "").strip()
         caption = f"🎬 {anime['name']}"
         if source_caption:
-            caption += f"\\n\\n{source_caption}"
+            caption += f"\n\n{source_caption}"
         # Telegram photo captions are limited to 1024 characters.
         caption = caption[:1000]
 
