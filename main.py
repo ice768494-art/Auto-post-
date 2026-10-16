@@ -1,5 +1,7 @@
 import os
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
 from pymongo import MongoClient
@@ -23,12 +25,20 @@ from telegram.ext import (
 # CONFIGURATION
 # =========================
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_ID = int(os.environ["ADMIN_ID"])
-MONGO_URI = os.environ["MONGO_URI"]
-DEFAULT_MAIN_CHANNEL_ID = int(
-    os.environ["MAIN_CHANNEL_ID"]
-)
+def required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(
+            f"Missing required environment variable: {name}. "
+            "Add it in Render > Environment."
+        )
+    return value
+
+
+BOT_TOKEN = required_env("BOT_TOKEN")
+ADMIN_ID = int(required_env("ADMIN_ID"))
+MONGO_URI = required_env("MONGO_URI")
+DEFAULT_MAIN_CHANNEL_ID = int(required_env("MAIN_CHANNEL_ID"))
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -526,9 +536,17 @@ async def handle_channel_post(
     main_channel_id = get_main_channel_id()
 
     try:
+        source_caption = (message.caption or "").strip()
+        caption = f"🎬 {anime['name']}"
+        if source_caption:
+            caption += f"\\n\\n{source_caption}"
+        # Telegram photo captions are limited to 1024 characters.
+        caption = caption[:1000]
+
         await context.bot.send_photo(
             chat_id=main_channel_id,
             photo=anime["poster_file_id"],
+            caption=caption,
             reply_markup=keyboard,
         )
 
@@ -568,7 +586,40 @@ async def error_handler(
 # START BOT
 # =========================
 
+class HealthHandler(BaseHTTPRequestHandler):
+    """Small HTTP endpoint so Render Web Service health checks succeed."""
+
+    def do_GET(self):
+        if self.path in ("/", "/health"):
+            body = b"Anime Auto Poster Bot is running."
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            body = b"Not found"
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        logger.info("HTTP: " + format, *args)
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info("Health server listening on port %s", port)
+
+
 def main():
+    start_health_server()
+
     app = (
         Application.builder()
         .token(BOT_TOKEN)
