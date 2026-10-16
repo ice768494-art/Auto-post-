@@ -1,5 +1,10 @@
 import os
 import logging
+from urllib.parse import urlparse
+
+from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -10,319 +15,504 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ContextTypes,
+    ConversationHandler,
     filters,
 )
-from pymongo import MongoClient
 
-# ================= CONFIGURATION =================
+# =========================
+# CONFIGURATION
+# =========================
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 MONGO_URI = os.environ["MONGO_URI"]
-MAIN_CHANNEL_ID = int(os.environ["MAIN_CHANNEL_ID"])
+DEFAULT_MAIN_CHANNEL_ID = int(
+    os.environ["MAIN_CHANNEL_ID"]
+)
 
-# ==================================================
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-mongo = MongoClient(MONGO_URI)
-db = mongo["anime_auto_poster"]
-anime_collection = db["anime"]
+# =========================
+# MONGODB
+# =========================
 
-# Temporary admin conversation states
-admin_states = {}
+mongo_client = MongoClient(
+    MONGO_URI,
+    serverSelectionTimeoutMS=10000,
+)
+
+mongo_client.admin.command("ping")
+
+db = mongo_client["anime_auto_poster"]
+
+anime_collection = db["anime"]
+settings_collection = db["settings"]
+processed_collection = db["processed_posts"]
+
+processed_collection.create_index(
+    [("channel_id", 1), ("message_id", 1)],
+    unique=True,
+)
+
+# =========================
+# CONVERSATION STATES
+# =========================
+
+ANIME_NAME = 1
+CHANNEL_ID = 2
+JOIN_URL = 3
+POSTER = 4
 
 
 def is_admin(update: Update) -> bool:
-    return (
-        update.effective_user is not None
-        and update.effective_user.id == ADMIN_ID
-    )
+    user = update.effective_user
+    return bool(user and user.id == ADMIN_ID)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_only(update: Update) -> bool:
     if not is_admin(update):
-        await update.effective_message.reply_text(
-            "⛔ You are not authorized to use this bot."
-        )
-        return
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "⛔ You are not authorized to use this command."
+            )
+        return False
 
-    await update.effective_message.reply_text(
-        "🎬 Anime Auto Poster Bot\n\n"
-        "/addanime - Add an anime\n"
-        "/removeanime - Remove an anime\n"
-        "/listanime - List anime\n"
-        "/setmain - Set Main Channel\n"
-        "/setposter - Change poster\n"
-        "/cancel - Cancel current operation\n"
-        "/help - Show commands"
-    )
+    return True
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-
-    await update.effective_message.reply_text(
-        "Commands:\n"
-        "/addanime - Register anime\n"
-        "/removeanime - Remove anime\n"
-        "/listanime - List anime\n"
-        "/setmain - Set Main Channel\n"
-        "/setposter - Update poster\n"
-        "/cancel - Cancel operation"
-    )
-
-
-async def addanime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-
-    admin_states[ADMIN_ID] = {"action": "add"}
-    await update.effective_message.reply_text(
-        "Send the anime name."
-    )
-
-
-async def removeanime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-
-    admin_states[ADMIN_ID] = {"action": "remove"}
-    await update.effective_message.reply_text(
-        "Send the exact anime name to remove."
-    )
-
-
-async def setposter(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-
-    admin_states[ADMIN_ID] = {"action": "poster"}
-    await update.effective_message.reply_text(
-        "Send the anime name whose poster you want to change."
-    )
-
-
-async def setmain(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global MAIN_CHANNEL_ID
-
-    if not is_admin(update):
-        return
-
-    if not context.args:
-        await update.effective_message.reply_text(
-            "Usage: /setmain -1001234567890"
-        )
-        return
-
-    try:
-        new_channel_id = int(context.args[0])
-    except ValueError:
-        await update.effective_message.reply_text(
-            "Invalid channel ID."
-        )
-        return
-
-    global main_channel_id
-    main_channel_id = new_channel_id
-
-    await update.effective_message.reply_text(
-        f"✅ Main Channel ID updated to {new_channel_id}.\n"
-        "Note: Also update MAIN_CHANNEL_ID in Render's environment "
-        "variables to keep this setting after a restart."
-    )
-
-
-async def listanime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-
-    items = list(anime_collection.find({}, {"_id": 0, "name": 1, "channel_id": 1}))
-
-    if not items:
-        await update.effective_message.reply_text(
-            "No anime registered yet. Use /addanime."
-        )
-        return
-
-    lines = ["🎬 Registered Anime:\n"]
-    for item in items:
-        lines.append(
-            f"• {item['name']} — {item['channel_id']}"
-        )
-
-    await update.effective_message.reply_text("\n".join(lines))
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        return
-
-    admin_states.pop(ADMIN_ID, None)
-    await update.effective_message.reply_text(
-        "❌ Operation cancelled."
-    )
-
-
-async def handle_admin_message(
+async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
     if not is_admin(update):
+        await update.effective_message.reply_text(
+            "🎬 Anime Auto Poster Bot is running."
+        )
         return
 
-    state = admin_states.get(ADMIN_ID)
-    if not state:
-        return
+    await update.effective_message.reply_text(
+        "🎬 ANIME AUTO POSTER BOT\n\n"
+        "⚡ Automatic episode posting is enabled.\n\n"
+        "Commands:\n"
+        "/addanime - Register an anime\n"
+        "/listanime - List registered anime\n"
+        "/removeanime - Remove an anime\n"
+        "/setmain - Change the Main Channel\n"
+        "/cancel - Cancel the current operation\n"
+        "/help - Show commands"
+    )
 
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.effective_message.reply_text(
+        "🎬 ANIME AUTO POSTER BOT\n\n"
+        "/addanime - Register an anime\n"
+        "/listanime - List registered anime\n"
+        "/removeanime <name> - Remove an anime\n"
+        "/setmain <channel_id> - Change Main Channel\n"
+        "/cancel - Cancel an operation\n\n"
+        "The bot automatically detects new channel posts.\n"
+        "Each anime needs a source channel, Join Channel link, "
+        "and custom poster."
+    )
+
+
+# =========================
+# ADD ANIME WIZARD
+# =========================
+
+async def add_anime_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not await admin_only(update):
+        return ConversationHandler.END
+
+    context.user_data["new_anime"] = {}
+
+    await update.effective_message.reply_text(
+        "🎬 Enter the anime name.\n\n"
+        "Example: Black Clover"
+    )
+
+    return ANIME_NAME
+
+
+async def receive_anime_name(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    name = update.effective_message.text.strip()
+
+    if not name:
+        await update.effective_message.reply_text(
+            "Please enter a valid anime name."
+        )
+        return ANIME_NAME
+
+    context.user_data["new_anime"]["name"] = name
+
+    await update.effective_message.reply_text(
+        "📢 Send the source channel ID.\n\n"
+        "Example:\n"
+        "-1001234567890\n\n"
+        "The bot must be an administrator in this channel."
+    )
+
+    return CHANNEL_ID
+
+
+async def receive_channel_id(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    try:
+        channel_id = int(update.effective_message.text.strip())
+
+        if channel_id >= 0:
+            raise ValueError
+
+    except (ValueError, AttributeError):
+        await update.effective_message.reply_text(
+            "❌ Invalid channel ID.\n"
+            "Send a channel ID such as -1001234567890."
+        )
+        return CHANNEL_ID
+
+    context.user_data["new_anime"]["channel_id"] = channel_id
+
+    await update.effective_message.reply_text(
+        "🔗 Send the Join Channel URL.\n\n"
+        "For example, a public channel link or a valid "
+        "private-channel invite link."
+    )
+
+    return JOIN_URL
+
+
+def valid_telegram_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value.strip())
+
+        return (
+            parsed.scheme == "https"
+            and parsed.netloc.lower() in {
+                "t.me",
+                "www.t.me",
+                "telegram.me",
+                "www.telegram.me",
+            }
+            and bool(parsed.path.strip("/"))
+        )
+    except Exception:
+        return False
+
+
+async def receive_join_url(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    join_url = update.effective_message.text.strip()
+
+    if not valid_telegram_url(join_url):
+        await update.effective_message.reply_text(
+            "❌ Please send a valid Telegram channel URL."
+        )
+        return JOIN_URL
+
+    context.user_data["new_anime"]["join_url"] = join_url
+
+    await update.effective_message.reply_text(
+        "🖼️ Now upload the custom poster as a PHOTO.\n\n"
+        "The poster will be used for every new episode "
+        "from this anime."
+    )
+
+    return POSTER
+
+
+async def receive_poster(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     message = update.effective_message
-    action = state["action"]
 
-    if action == "add":
-        state["name"] = message.text.strip()
-        state["action"] = "channel_id"
+    if not message.photo:
         await message.reply_text(
-            "Send the source channel ID (example: -1001234567890).\n"
-            "Make sure the bot is an administrator in that channel."
+            "❌ Please upload the poster as a Telegram photo."
         )
+        return POSTER
 
-    elif action == "channel_id":
-        try:
-            state["channel_id"] = int(message.text.strip())
-        except (ValueError, AttributeError):
-            await message.reply_text("Invalid channel ID. Try again.")
-            return
+    data = context.user_data.get("new_anime", {})
 
-        state["action"] = "watch_url"
+    if not data:
         await message.reply_text(
-            "Send the custom Watch Now URL."
+            "Your registration session expired. Use /addanime again."
+        )
+        return ConversationHandler.END
+
+    data["poster_file_id"] = message.photo[-1].file_id
+
+    anime_key = data["name"].casefold()
+
+    anime_collection.update_one(
+        {"name_key": anime_key},
+        {
+            "$set": {
+                "name": data["name"],
+                "name_key": anime_key,
+                "channel_id": data["channel_id"],
+                "join_url": data["join_url"],
+                "poster_file_id": data["poster_file_id"],
+                "enabled": True,
+            }
+        },
+        upsert=True,
+    )
+
+    context.user_data.pop("new_anime", None)
+
+    await message.reply_text(
+        "✅ ANIME REGISTERED SUCCESSFULLY!\n\n"
+        f"🎬 Anime: {data['name']}\n"
+        f"📢 Source Channel: {data['channel_id']}\n\n"
+        "⚡ New episodes will now be processed automatically."
+    )
+
+    return ConversationHandler.END
+
+
+async def cancel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    context.user_data.pop("new_anime", None)
+
+    await update.effective_message.reply_text(
+        "❌ Operation cancelled."
+    )
+
+    return ConversationHandler.END
+
+
+# =========================
+# LIST ANIME
+# =========================
+
+async def list_anime(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not await admin_only(update):
+        return
+
+    anime_list = list(
+        anime_collection.find(
+            {},
+            {"name": 1, "channel_id": 1, "enabled": 1},
+        ).sort("name", 1)
+    )
+
+    if not anime_list:
+        await update.effective_message.reply_text(
+            "No anime registered yet.\nUse /addanime."
+        )
+        return
+
+    lines = ["🎬 REGISTERED ANIME\n"]
+
+    for anime in anime_list:
+        status = "✅" if anime.get("enabled", True) else "⏸️"
+
+        lines.append(
+            f"{status} {anime['name']}\n"
+            f"Channel ID: {anime['channel_id']}\n"
         )
 
-    elif action == "watch_url":
-        url = message.text.strip()
+    await update.effective_message.reply_text(
+        "\n".join(lines)
+    )
 
-        if not url.startswith(("https://", "http://")):
-            await message.reply_text(
-                "Please send a valid URL starting with https:// or http://."
-            )
-            return
 
-        state["watch_url"] = url
-        state["action"] = "join_url"
-        await message.reply_text(
-            "Send the Join Channel URL."
+# =========================
+# REMOVE ANIME
+# =========================
+
+async def remove_anime(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not await admin_only(update):
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage:\n/removeanime Black Clover"
+        )
+        return
+
+    name = " ".join(context.args).strip()
+
+    result = anime_collection.delete_one(
+        {"name_key": name.casefold()}
+    )
+
+    if result.deleted_count:
+        await update.effective_message.reply_text(
+            f"✅ Removed anime: {name}"
+        )
+    else:
+        await update.effective_message.reply_text(
+            "❌ Anime not found."
         )
 
-    elif action == "join_url":
-        url = message.text.strip()
 
-        if not url.startswith(("https://", "http://")):
-            await message.reply_text(
-                "Please send a valid URL starting with https:// or http://."
-            )
-            return
+# =========================
+# SET MAIN CHANNEL
+# =========================
 
-        state["join_url"] = url
-        state["action"] = "poster"
-        await message.reply_text(
-            "Now send the poster as a photo."
+async def set_main(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not await admin_only(update):
+        return
+
+    if len(context.args) != 1:
+        await update.effective_message.reply_text(
+            "Usage:\n/setmain -1001234567890"
+        )
+        return
+
+    try:
+        channel_id = int(context.args[0])
+
+        if channel_id >= 0:
+            raise ValueError
+
+    except ValueError:
+        await update.effective_message.reply_text(
+            "❌ Please provide a valid channel ID."
+        )
+        return
+
+    settings_collection.update_one(
+        {"key": "main_channel_id"},
+        {"$set": {"value": channel_id}},
+        upsert=True,
+    )
+
+    await update.effective_message.reply_text(
+        f"✅ Main Channel updated to {channel_id}"
+    )
+
+
+def get_main_channel_id() -> int:
+    setting = settings_collection.find_one(
+        {"key": "main_channel_id"}
+    )
+
+    if setting:
+        return int(setting["value"])
+
+    return DEFAULT_MAIN_CHANNEL_ID
+
+
+# =========================
+# SOURCE POST LINK
+# =========================
+
+def make_episode_url(chat, message_id: int) -> str:
+    # Public channel
+    if chat.username:
+        return (
+            f"https://t.me/{chat.username}/{message_id}"
         )
 
-    elif action == "poster":
-        if not message.photo:
-            await message.reply_text(
-                "Please send the poster as a Telegram photo."
-            )
-            return
+    # Private channel: the user must already have access
+    chat_id = str(chat.id)
 
-        poster_file_id = message.photo[-1].file_id
-
-        if action == "poster" and "name" not in state:
-            anime_name = state.get("anime_name")
-            if not anime_name:
-                await message.reply_text(
-                    "Anime name is missing. Use /addanime to register a new anime."
-                )
-                admin_states.pop(ADMIN_ID, None)
-                return
-        else:
-            anime_name = state["name"]
-
-        document = {
-            "name": anime_name,
-            "channel_id": state["channel_id"],
-            "watch_url": state["watch_url"],
-            "join_url": state["join_url"],
-            "poster_file_id": poster_file_id,
-        }
-
-        anime_collection.update_one(
-            {"channel_id": state["channel_id"]},
-            {"$set": document},
-            upsert=True,
+    if chat_id.startswith("-100"):
+        internal_id = chat_id[4:]
+    else:
+        raise ValueError(
+            "Unsupported private channel ID format."
         )
 
-        admin_states.pop(ADMIN_ID, None)
+    return (
+        f"https://t.me/c/{internal_id}/{message_id}"
+    )
 
-        await message.reply_text(
-            f"✅ {anime_name} registered successfully!\n"
-            "The bot will announce new media posts from this channel."
-        )
 
-    elif action == "remove":
-        name = message.text.strip()
-        result = anime_collection.delete_one({"name": name})
-        admin_states.pop(ADMIN_ID, None)
-
-        if result.deleted_count:
-            await message.reply_text(f"✅ Removed {name}.")
-        else:
-            await message.reply_text("Anime not found.")
-
-    elif action == "poster":
-        state["anime_name"] = message.text.strip()
-        state["action"] = "new_poster"
-        await message.reply_text("Send the replacement poster photo.")
-
-    elif action == "new_poster":
-        if not message.photo:
-            await message.reply_text("Please send a photo.")
-            return
-
-        anime_collection.update_one(
-            {"name": state["anime_name"]},
-            {"$set": {"poster_file_id": message.photo[-1].file_id}},
-        )
-        admin_states.pop(ADMIN_ID, None)
-        await message.reply_text("✅ Poster updated.")
-
+# =========================
+# AUTOMATIC CHANNEL POSTS
+# =========================
 
 async def handle_channel_post(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    post = update.channel_post
-    if not post:
-        return
+    message = update.channel_post
 
-    # Only photos, videos, and documents trigger announcements.
-    if not (post.photo or post.video or post.document):
+    if not message:
         return
 
     anime = anime_collection.find_one(
-        {"channel_id": post.chat.id}
+        {
+            "channel_id": message.chat_id,
+            "enabled": True,
+        }
     )
 
     if not anime:
         return
 
+    # Process supported episode media only.
+    if not (
+        message.photo
+        or message.video
+        or message.document
+    ):
+        return
+
+    if not anime.get("poster_file_id"):
+        logger.warning(
+            "No poster configured for %s",
+            anime.get("name"),
+        )
+        return
+
+    try:
+        episode_url = make_episode_url(
+            message.chat,
+            message.message_id,
+        )
+    except ValueError:
+        logger.exception("Could not generate episode URL.")
+        return
+
+    # Prevent duplicate announcements.
+    post_key = {
+        "channel_id": message.chat_id,
+        "message_id": message.message_id,
+    }
+
+    if processed_collection.find_one(post_key):
+        return
+
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "📺 WATCH NOW",
-                url=anime["watch_url"],
+                "📺 WATCH EPISODE",
+                url=episode_url,
             )
         ],
         [
@@ -333,39 +523,109 @@ async def handle_channel_post(
         ],
     ])
 
+    main_channel_id = get_main_channel_id()
+
     try:
         await context.bot.send_photo(
-            chat_id=MAIN_CHANNEL_ID,
+            chat_id=main_channel_id,
             photo=anime["poster_file_id"],
             reply_markup=keyboard,
         )
-        logger.info("Announcement sent for %s", anime["name"])
+
+        processed_collection.insert_one(post_key)
+
+        logger.info(
+            "Posted %s episode message %s",
+            anime["name"],
+            message.message_id,
+        )
+
+    except DuplicateKeyError:
+        logger.info("Duplicate episode was already processed.")
 
     except Exception:
-        logger.exception("Failed to send announcement")
+        logger.exception(
+            "Failed to publish episode from %s",
+            anime["name"],
+        )
 
+
+# =========================
+# ERROR HANDLER
+# =========================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    logger.error(
+        "Unhandled bot error",
+        exc_info=context.error,
+    )
+
+
+# =========================
+# START BOT
+# =========================
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    conversation = ConversationHandler(
+        entry_points=[
+            CommandHandler("addanime", add_anime_start)
+        ],
+        states={
+            ANIME_NAME: [
+                MessageHandler(
+                    filters.ChatType.PRIVATE
+                    & filters.TEXT
+                    & ~filters.COMMAND,
+                    receive_anime_name,
+                )
+            ],
+            CHANNEL_ID: [
+                MessageHandler(
+                    filters.ChatType.PRIVATE
+                    & filters.TEXT
+                    & ~filters.COMMAND,
+                    receive_channel_id,
+                )
+            ],
+            JOIN_URL: [
+                MessageHandler(
+                    filters.ChatType.PRIVATE
+                    & filters.TEXT
+                    & ~filters.COMMAND,
+                    receive_join_url,
+                )
+            ],
+            POSTER: [
+                MessageHandler(
+                    filters.ChatType.PRIVATE
+                    & filters.PHOTO,
+                    receive_poster,
+                )
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel)
+        ],
+        allow_reentry=True,
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("addanime", addanime))
-    app.add_handler(CommandHandler("removeanime", removeanime))
-    app.add_handler(CommandHandler("listanime", listanime))
-    app.add_handler(CommandHandler("setmain", setmain))
-    app.add_handler(CommandHandler("setposter", setposter))
-    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(conversation)
+    app.add_handler(CommandHandler("listanime", list_anime))
+    app.add_handler(CommandHandler("removeanime", remove_anime))
+    app.add_handler(CommandHandler("setmain", set_main))
 
-    # Admin setup conversations.
-    app.add_handler(
-        MessageHandler(
-            filters.ChatType.PRIVATE & ~filters.COMMAND,
-            handle_admin_message,
-        )
-    )
-
-    # Telegram channel posts.
+    # Channel posts are different from ordinary messages.
     app.add_handler(
         MessageHandler(
             filters.UpdateType.CHANNEL_POST,
@@ -373,9 +633,12 @@ def main():
         )
     )
 
+    app.add_error_handler(error_handler)
+
     logger.info("Anime Auto Poster Bot started.")
+
     app.run_polling(
-        allowed_updates=["message", "channel_post"]
+        allowed_updates=Update.ALL_TYPES
     )
 
 
