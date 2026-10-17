@@ -1,34 +1,38 @@
 ANIME AUTO POSTER BOT — RENDER WEB SERVICE
 
-FILES
-- main.py: Telegram bot code
+Files:
+- main.py: bot code
 - requirements.txt: Python dependencies
-- render.yaml: Render Blueprint configuration
+- render.yaml: Render configuration
 
-RENDER SETUP
+Render environment variables:
+BOT_TOKEN       Telegram bot token from BotFather
+ADMIN_ID        Your Telegram numeric user ID (multiple IDs can be comma-separated)
+MONGO_URI       MongoDB connection URI
+MAIN_CHANNEL_ID Numeric ID of the destination/main channel (usually -100...)
+
+Setup:
 1. Upload these files to a GitHub repository.
-2. In Render, create a new Web Service from that repository (or use the Blueprint from render.yaml).
-3. Build command: pip install -r requirements.txt
-4. Start command: python main.py
-5. Add these environment variables in Render:
-   BOT_TOKEN = your Telegram bot token
-   ADMIN_ID = your numeric Telegram user ID
-   MONGO_URI = your MongoDB connection string
-   MAIN_CHANNEL_ID = your Main Channel numeric ID (usually starts with -100)
-6. Ensure the bot is an administrator in every source channel and in the Main Channel. It needs permission to post in the Main Channel.
-7. Start the bot and send /start to it privately.
+2. Create a Render Web Service from that repository.
+3. Add the four environment variables above.
+4. Deploy.
+5. Add the bot as administrator to the main channel with permission to post.
+6. Add the bot as administrator to each source channel.
+7. In a private chat with the bot, run /addanime and follow the prompts.
 
-BOT COMMANDS
-/start
-/help
-/addanime
-/listanime
-/removeanime Black Clover
-/setmain -1001234567890
-/cancel
+Commands:
+ /start
+ /help
+ /addanime
+ /listanime
+ /removeanime <source_channel_id>
+ /cancel
 
-HOW IT WORKS
-Register each anime using /addanime. Provide the anime name, source channel ID, Join Channel URL, and a custom poster photo. When a new photo, video, or document post appears in a registered source channel, the bot posts an announcement in the Main Channel using the saved poster and two buttons: WATCH EPISODE (links to the original source post) and JOIN CHANNEL (uses the configured URL).
+Supported source channel posts: photos, videos, animations, and documents.
+The bot posts a new message in the main channel with WATCH EPISODE and JOIN CHANNEL buttons.
 
-NOTE
-This code posts a poster announcement with buttons; it does not copy/re-upload the episode media itself. Render polling requires the service to remain running. Never share BOT_TOKEN or MONGO_URI publicly.
+Notes:
+- The source channel must be registered using /addanime.
+- Telegram channel IDs are numeric; private/supergroup channel IDs commonly begin with -100.
+- Use a direct image URL for a custom poster, or type SKIP.
+- Keep BOT_TOKEN and MONGO_URI private.
