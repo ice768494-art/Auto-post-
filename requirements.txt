@@ -1,2 +1,2 @@
-python-telegram-bot>=20.8,<22
-pymongo[srv]>=4.6,<5
+python-telegram-bot>=21.0,<22.0
+pymongo[srv]>=4.6,<5.0
