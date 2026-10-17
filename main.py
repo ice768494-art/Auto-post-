@@ -618,78 +618,11 @@ def start_health_server():
 
 
 def main():
-    start_health_server()
-
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    conversation = ConversationHandler(
-        entry_points=[
-            CommandHandler("addanime", add_anime_start)
-        ],
-        states={
-            ANIME_NAME: [
-                MessageHandler(
-                    filters.ChatType.PRIVATE
-                    & filters.TEXT
-                    & ~filters.COMMAND,
-                    receive_anime_name,
-                )
-            ],
-            CHANNEL_ID: [
-                MessageHandler(
-                    filters.ChatType.PRIVATE
-                    & filters.TEXT
-                    & ~filters.COMMAND,
-                    receive_channel_id,
-                )
-            ],
-            JOIN_URL: [
-                MessageHandler(
-                    filters.ChatType.PRIVATE
-                    & filters.TEXT
-                    & ~filters.COMMAND,
-                    receive_join_url,
-                )
-            ],
-            POSTER: [
-                MessageHandler(
-                    filters.ChatType.PRIVATE
-                    & filters.PHOTO,
-                    receive_poster,
-                )
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel)
-        ],
-        allow_reentry=True,
-    )
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(conversation)
-    app.add_handler(CommandHandler("listanime", list_anime))
-    app.add_handler(CommandHandler("removeanime", remove_anime))
-    app.add_handler(CommandHandler("setmain", set_main))
-
-    # Channel posts are different from ordinary messages.
-    app.add_handler(
-        MessageHandler(
-            filters.UpdateType.CHANNEL_POST,
-            handle_channel_post,
-        )
-    )
-
-    app.add_error_handler(error_handler)
-
-    logger.info("Anime Auto Poster Bot started.")
+    app = create_application()
 
     app.run_polling(
-        allowed_updates=Update.ALL_TYPES
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False
     )
 
 
