@@ -12,7 +12,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# Initialize Flask web server to satisfy Render Web Service port requirements
+# Initialize Flask web server for Render Web Service
 app = Flask(__name__)
 
 @app.route('/')
@@ -52,14 +52,48 @@ async def handle_new_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "message_id": message_id
         })
 
-        # Copy the exact post to the Main Channel
-        await context.bot.copy_message(
-            chat_id=MAIN_CHANNEL_ID,
-            from_chat_id=chat_id,
-            message_id=message_id
+        # Get original caption or text if any exist
+        original_caption = message.caption or message.text or "New Episode Available!"
+
+        # Create your custom post layout
+        custom_caption = (
+            f"🔥 **NEW ANIME EPISODE ADDED!** 🔥\n\n"
+            f"{original_caption}\n\n"
+            f"👉 *Join our channel for more updates!*"
         )
+
+        # Send custom post based on media type
+        if message.video:
+            await context.bot.send_video(
+                chat_id=MAIN_CHANNEL_ID,
+                video=message.video.file_id,
+                caption=custom_caption,
+                parse_mode="Markdown"
+            )
+        elif message.photo:
+            # message.photo is a list of sizes, [-1] is the highest quality photo
+            await context.bot.send_photo(
+                chat_id=MAIN_CHANNEL_ID,
+                photo=message.photo[-1].file_id,
+                caption=custom_caption,
+                parse_mode="Markdown"
+            )
+        elif message.document:
+            await context.bot.send_document(
+                chat_id=MAIN_CHANNEL_ID,
+                document=message.document.file_id,
+                caption=custom_caption,
+                parse_mode="Markdown"
+            )
+        else:
+            # If it's just text
+            await context.bot.send_message(
+                chat_id=MAIN_CHANNEL_ID,
+                text=custom_caption,
+                parse_mode="Markdown"
+            )
         
-        logging.info(f"Successfully copied post from channel {chat_id}, message ID: {message_id}")
+        logging.info(f"Successfully uploaded custom post from channel {chat_id}, message ID: {message_id}")
 
 def main():
     if not BOT_TOKEN or not MONGO_URI or not SOURCE_CHANNEL_IDS:
@@ -75,7 +109,7 @@ def main():
     channel_handler = MessageHandler(filters.Chat(chat_id=SOURCE_CHANNEL_IDS), handle_new_anime)
     application.add_handler(channel_handler)
 
-    print("Bot and Web Server wrapper are running...")
+    print("Custom Poster Bot and Web Server are running...")
     application.run_polling()
 
 if __name__ == '__main__':
