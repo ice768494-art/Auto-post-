@@ -244,7 +244,8 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         [InlineKeyboardButton("▶️ WATCH EPISODE", url=watch_url)],
         [InlineKeyboardButton("📢 JOIN CHANNEL", url=config["join_url"])],
     ])
-    caption = f"🎬 <b>{config['anime_name']}</b>\\n\\n👇 Tap below to watch the episode."
+    caption = f"🎬 <b>{config['anime_name']}</b>
+      👇 Tap below to watch the episode."
     try:
         poster_url = config.get("poster_url", "")
         if poster_url:
