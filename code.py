@@ -635,6 +635,26 @@ def main():
             handle_channel_post,
         )
     )
+    async def debug_channel_post(update, context):
+    message = update.channel_post
+
+    if message:
+        log.warning(
+            "DEBUG: Received channel post from chat_id=%s, message_id=%s",
+            message.chat.id,
+            message.message_id,
+        )
+    else:
+        log.warning("DEBUG: Update received without channel_post")
+
+
+application.add_handler(
+    MessageHandler(
+        filters.UpdateType.CHANNEL_POST,
+        debug_channel_post,
+    ),
+    group=1,
+                 )
 
     log.info("Anime Auto Poster Bot starting...")
 
