@@ -1,140 +1,359 @@
 import os
 import logging
-from threading import Thread
-from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters, CommandHandler
-from pymongo import MongoClient
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import quote
 
-# Enable logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+from pymongo import MongoClient, ASCENDING
+from pymongo.errors import DuplicateKeyError
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ConversationHandler,
+    ContextTypes, filters,
 )
 
-# Initialize Flask web server for Render Web Service
-app = Flask(__name__)
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("anime_auto_poster")
 
-@app.route('/')
-def index():
-    return "Preset Anime Auto-Poster is running!"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_IDS_RAW = os.getenv("ADMIN_ID", "").strip()
+MONGO_URI = os.getenv("MONGO_URI", "").strip()
+MAIN_CHANNEL_ID_RAW = os.getenv("MAIN_CHANNEL_ID", "").strip()
 
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+if not BOT_TOKEN:
+    raise RuntimeError("Missing BOT_TOKEN environment variable")
+if not MONGO_URI:
+    raise RuntimeError("Missing MONGO_URI environment variable")
+if not MAIN_CHANNEL_ID_RAW:
+    raise RuntimeError("Missing MAIN_CHANNEL_ID environment variable")
 
-# Fetch credentials from Render Environment Variables
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-MONGO_URI = os.getenv("MONGO_URI")
-MAIN_CHANNEL_ID = int(os.getenv("MAIN_CHANNEL_ID", "0"))
+try:
+    MAIN_CHANNEL_ID = int(MAIN_CHANNEL_ID_RAW)
+except ValueError as exc:
+    raise RuntimeError("MAIN_CHANNEL_ID must be a numeric Telegram channel ID") from exc
 
-# Initialize MongoDB Connection
-client = MongoClient(MONGO_URI)
-db = client["anime_bot_database"]
-config_collection = db["channel_presets"]
-uploads_collection = db["anime_uploads"]
+ADMIN_IDS = set()
+for item in ADMIN_IDS_RAW.split(","):
+    item = item.strip()
+    if item:
+        try:
+            ADMIN_IDS.add(int(item))
+        except ValueError:
+            log.warning("Ignoring invalid ADMIN_ID entry: %s", item)
 
-# 1. Admin Command to set/predefine a channel's poster and watch link
-async def set_anime_preset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if message and message.photo and message.caption and message.caption.startswith("/setanime"):
-        parts = message.caption.replace("/setanime", "").split("|")
-        
-        if len(parts) < 3:
-            await message.reply_text(
-                "❌ **Invalid Format!**\n\n"
-                "Use this format with your poster image:\n"
-                "`/setanime Channel_ID | Anime Title | Watch_Link`",
-                parse_mode="Markdown"
-            )
-            return
+mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
+db = mongo_client["anime_auto_poster"]
+anime_collection = db["anime_sources"]
+processed_collection = db["processed_posts"]
+# Legacy records may exist without these fields. Remove only malformed
+# processed-post records before creating the unique index.
+processed_collection.delete_many({
+    "$or": [
+        {"source_chat_id": {"$exists": False}},
+        {"source_message_id": {"$exists": False}},
+        {"source_chat_id": None},
+        {"source_message_id": None},
+    ]
+})
+processed_collection.create_index(
+    [("source_chat_id", ASCENDING), ("source_message_id", ASCENDING)],
+    unique=True,
+)
+anime_collection.create_index([("source_chat_id", ASCENDING)], unique=True)
 
-        channel_id = int(parts[0].strip())
-        title = parts[1].strip()
-        watch_link = parts[2].strip()
-        poster_file_id = message.photo[-1].file_id
+# Conversation states
+ANIME_NAME, SOURCE_CHANNEL, JOIN_URL, POSTER_URL = range(4)
 
-        # Save or update the preset in MongoDB
-        config_collection.update_one(
-            {"channel_id": channel_id},
-            {
-                "$set": {
-                    "title": title,
-                    "watch_link": watch_link,
-                    "poster_file_id": poster_file_id
-                }
-            },
-            upsert=True
-        )
 
-        await message.reply_text(f"✅ Preset saved successfully for Channel ID: `{channel_id}`!", parse_mode="Markdown")
+def is_admin(user_id: int) -> bool:
+    # If ADMIN_ID is omitted, commands are unavailable to everyone for safety.
+    return user_id in ADMIN_IDS
 
-# 2. Auto-detect new uploads in any registered anime source channel
-async def handle_anime_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def admin_only(update: Update) -> bool:
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        if update.effective_message:
+            await update.effective_message.reply_text("⛔ This command is for bot admins only.")
+        return False
+    return True
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "🎬 Anime Auto Poster Bot is running!\\n\\n"
+        "Admin commands:\\n"
+        "/addanime - Register a source channel\\n"
+        "/listanime - List registered channels\\n"
+        "/removeanime - Remove a source channel\\n"
+        "/cancel - Cancel the current setup\\n\\n"
+        "When the bot is an admin in a registered source channel, new photo/video/document "
+        "posts are automatically forwarded as an episode post to the main channel."
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+
+
+async def addanime_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only(update):
+        return ConversationHandler.END
+    await update.effective_message.reply_text("Send the anime name:")
+    return ANIME_NAME
+
+
+async def addanime_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["anime_name"] = update.effective_message.text.strip()
+    await update.effective_message.reply_text(
+        "Send the source channel ID (usually starts with -100). "
+        "Make the bot an administrator in that channel first."
+    )
+    return SOURCE_CHANNEL
+
+
+async def addanime_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        context.user_data["source_chat_id"] = int(update.effective_message.text.strip())
+    except ValueError:
+        await update.effective_message.reply_text("That channel ID is not numeric. Send the ID again:")
+        return SOURCE_CHANNEL
+    await update.effective_message.reply_text(
+        "Send the channel's public join URL (for example https://t.me/yourchannel). "
+        "For a private channel, send its invite URL."
+    )
+    return JOIN_URL
+
+
+async def addanime_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    join_url = update.effective_message.text.strip()
+    if not join_url.startswith(("https://t.me/", "http://t.me/")):
+        await update.effective_message.reply_text("Please send a Telegram URL beginning with https://t.me/")
+        return JOIN_URL
+    context.user_data["join_url"] = join_url
+    await update.effective_message.reply_text(
+        "Send a direct poster image URL, or type SKIP to use the episode's media as the post image."
+    )
+    return POSTER_URL
+
+
+async def addanime_poster(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only(update):
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    poster = update.effective_message.text.strip()
+    if poster.upper() == "SKIP":
+        poster = ""
+
+    record = {
+        "anime_name": context.user_data["anime_name"],
+        "source_chat_id": context.user_data["source_chat_id"],
+        "join_url": context.user_data["join_url"],
+        "poster_url": poster,
+    }
+    anime_collection.update_one(
+        {"source_chat_id": record["source_chat_id"]},
+        {"$set": record},
+        upsert=True,
+    )
+    await update.effective_message.reply_text(
+        "✅ Anime source saved!\\n"
+        f"🎬 Name: {record['anime_name']}\\n"
+        f"🆔 Source: {record['source_chat_id']}\\n"
+        "New supported posts in that channel will be published to the main channel."
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.effective_message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+
+async def listanime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only(update):
+        return
+    records = list(anime_collection.find().sort("anime_name", ASCENDING))
+    if not records:
+        await update.effective_message.reply_text("No anime source channels registered yet. Use /addanime.")
+        return
+    lines = ["📚 Registered anime sources:"]
+    for rec in records:
+        lines.append(f"• {rec.get('anime_name', 'Unknown')} — {rec.get('source_chat_id')}")
+    await update.effective_message.reply_text("\\n".join(lines))
+
+
+async def removeanime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await admin_only(update):
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /removeanime <source_channel_id>")
+        return
+    try:
+        channel_id = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("Channel ID must be numeric.")
+        return
+    result = anime_collection.delete_one({"source_chat_id": channel_id})
+    if result.deleted_count:
+        await update.effective_message.reply_text("✅ Source channel removed.")
+    else:
+        await update.effective_message.reply_text("No registered source channel found with that ID.")
+
+
+def message_link(chat, message_id: int) -> str:
+    username = getattr(chat, "username", None)
+    if username:
+        return f"https://t.me/{username}/{message_id}"
+    chat_id = str(chat.id)
+    if chat_id.startswith("-100"):
+        internal_id = chat_id[4:]
+        return f"https://t.me/c/{internal_id}/{message_id}"
+    return "https://t.me/"
+
+
+async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.channel_post
-    if message:
-        chat_id = message.chat.id
-        message_id = message.message_id
+    if not message:
+        return
+    if not (message.photo or message.video or message.document or message.animation):
+        return
 
-        # Look up if this channel has a predefined preset in MongoDB
-        preset = config_collection.find_one({"channel_id": chat_id})
-        if not preset:
-            return  # Ignore channels that haven't been configured yet
+    source_id = message.chat.id
+    config = anime_collection.find_one({"source_chat_id": source_id})
+    if not config:
+        return
 
-        # Prevent duplicate posts for the same file/message ID
-        if uploads_collection.find_one({"chat_id": chat_id, "message_id": message_id}):
-            return
+    key = {"source_chat_id": source_id, "source_message_id": message.message_id}
+    # Reserve the source post before publishing so duplicate updates are ignored.
+    try:
+        processed_collection.insert_one({**key, "status": "processing"})
+    except DuplicateKeyError:
+        log.info("Ignoring duplicate source post %s/%s", source_id, message.message_id)
+        return
 
-        # Save record to MongoDB
-        uploads_collection.insert_one({"chat_id": chat_id, "message_id": message_id})
+    watch_url = message_link(message.chat, message.message_id)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ WATCH EPISODE", url=watch_url)],
+        [InlineKeyboardButton("📢 JOIN CHANNEL", url=config["join_url"])],
+    ])
+    caption = f"🎬 <b>{config['anime_name']}</b>\\n\\n👇 Tap below to watch the episode."
+    try:
+        poster_url = config.get("poster_url", "")
+        if poster_url:
+            await context.bot.send_photo(
+                chat_id=MAIN_CHANNEL_ID,
+                photo=poster_url,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        elif message.photo:
+            await context.bot.send_photo(
+                chat_id=MAIN_CHANNEL_ID,
+                photo=message.photo[-1].file_id,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        elif message.video:
+            await context.bot.send_video(
+                chat_id=MAIN_CHANNEL_ID,
+                video=message.video.file_id,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        elif message.animation:
+            await context.bot.send_animation(
+                chat_id=MAIN_CHANNEL_ID,
+                animation=message.animation.file_id,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        else:
+            await context.bot.send_document(
+                chat_id=MAIN_CHANNEL_ID,
+                document=message.document.file_id,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        processed_collection.update_one(key, {"$set": {"status": "published"}})
+        log.info("Published post from %s/%s", source_id, message.message_id)
+    except Exception:
+        processed_collection.delete_one(key)
+        log.exception("Failed to publish source post %s/%s", source_id, message.message_id)
 
-        # Grab preset details
-        title = preset["title"]
-        watch_link = preset["watch_link"]
-        poster_file_id = preset["poster_file_id"]
 
-        # Create inline watch button
-        keyboard = [[InlineKeyboardButton("▶️ Watch Now", url=watch_link)]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"OK"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-        # Format announcement caption
-        broadcast_caption = (
-            f"🔥 **NEW EPISODE ADDED!** 🔥\n\n"
-            f"📌 **{title}**\n\n"
-            f"👉 Click below to watch!"
-        )
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
 
-        # Broadcast preset poster + button to Main Channel
-        await context.bot.send_photo(
-            chat_id=MAIN_CHANNEL_ID,
-            photo=poster_file_id,
-            caption=broadcast_caption,
-            parse_mode="Markdown",
-            reply_markup=reply_markup
-        )
+    def log_message(self, format, *args):
+        log.info("Health HTTP: " + format, *args)
 
-        logging.info(f"Auto-posted update for {title} from channel {chat_id}")
+
+def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log.info("Health server listening on port %s", port)
+
 
 def main():
-    if not BOT_TOKEN or not MONGO_URI or not MAIN_CHANNEL_ID:
-        raise ValueError("Missing critical environment variables.")
+    # Check database connectivity early so deployment errors are clear.
+    mongo_client.admin.command("ping")
+    start_health_server()
 
-    # Start Flask web server in a background thread
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    # Start Telegram Bot application
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-    
-    # Handler to set presets in private chat
-    application.add_handler(MessageHandler(filters.PHOTO & filters.CaptionRegex(r"^/setanime"), set_anime_preset))
-    
-    # Handler to listen to channel uploads
-    application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_anime_upload))
+    conversation = ConversationHandler(
+        entry_points=[CommandHandler("addanime", addanime_start)],
+        states={
+            ANIME_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, addanime_name)],
+            SOURCE_CHANNEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, addanime_source)],
+            JOIN_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, addanime_join)],
+            POSTER_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, addanime_poster)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
 
-    print("Preset Auto-Poster Bot is running...")
-    application.run_polling()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(conversation)
+    application.add_handler(CommandHandler("listanime", listanime))
+    application.add_handler(CommandHandler("removeanime", removeanime))
+    application.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
 
-if __name__ == '__main__':
+    log.info("Anime Auto Poster Bot starting")
+    # python-telegram-bot's run_polling manages its own asyncio event loop.
+    # Do not wrap this call in asyncio.run().
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+    )
+
+
+if __name__ == "__main__":
     main()

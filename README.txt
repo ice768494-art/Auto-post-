@@ -1,7 +1,7 @@
 ANIME AUTO POSTER BOT — RENDER WEB SERVICE
 
 Files:
-- main.py: bot code
+- code.py: bot code
 - requirements.txt: Python dependencies
 - render.yaml: Render configuration
 

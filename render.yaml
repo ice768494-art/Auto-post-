@@ -3,7 +3,7 @@ services:
     name: anime-auto-poster
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: python code.py
     healthCheckPath: /
     envVars:
       - key: BOT_TOKEN
